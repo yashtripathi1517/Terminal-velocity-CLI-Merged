@@ -1,0 +1,44 @@
+Aapki context, provided README, visual slides, aur recent chat logs ke base par **RepoPilot** ke Design Note ko updated baseline features (Deterministic Detection + Local LLM Fallback + **Human-in-the-Loop AI Failure Diagnosis**) ke saath update kar diya gaya hai.
+
+---
+
+# 📄 Design Note: RepoPilot
+
+**Project Name:** RepoPilot
+
+**Track:** Terminal Velocity ("Can You Hack It?" Hackathon)
+
+**Author / Team:** Vikhyaat Srivastava & Team
+
+---
+
+### 1. Problem Statement
+
+Developers waste valuable engineering hours on repetitive, fragmented terminal workflows—such as identifying and running project setup commands across multi-language repositories, managing/switching environment variables across setups, cleaning up stale local git branches, and inspecting container or system logs.
+
+While custom shell scripts and aliases offer temporary fixes, they are rarely shared, standardized, or maintained. **RepoPilot** unifies these daily developer pain points into a single, fast, scriptable, and production-ready CLI utility.
+
+---
+
+### 2. Key Architecture & Design Choices
+
+* **Unified CLI Architecture (`repopilot <subcommand>`):**
+Built with explicit subcommand isolation (`setup`, `env`, `clean`, `logs`), strict adherence to standard exit codes (`0`: Success, `1`: User Error, `2`: Internal Error), clear error handling, and structured `--help` options.
+* **Deterministic-First Setup Engine (`repopilot setup`):**
+Uses a rule-based detection engine for standard manifest files (`requirements.txt`, `package.json`, `go.mod`). For non-standard or multi-package commands (e.g., splitting bulk `pip`/`npm` commands into modular steps), it intelligently orchestrates commands without breaking installation flows.
+* **Human-in-the-Loop AI Diagnosis & Fallback:**
+When ambiguous configurations or execution failures occur, RepoPilot routes context to a local LLM (Ollama). Crucially, it enforces a **strict safety boundary**: the AI analyzes the environment and proposes diagnostic fixes, but requires explicit user confirmation (`Proceed with execution? [y/N]`) before executing high-risk or system-level commands. Includes `--dry-run` for execution previews.
+* **Parent-Shell Environment Injection (`repopilot env`):**
+To bypass OS-level child process isolation (where subcommands cannot alter the parent terminal session), `repopilot env switch` outputs clean shell commands directly to `STDOUT` to be safely evaluated via `eval $(repopilot env switch <env>)`.
+* **Protected Branch Cleanup Engine (`repopilot clean`):**
+Prevents accidental repo damage by enforcing protection rules for core branches (`main`, `master`, `dev`) and the active branch, while allowing custom branch exclusions (`--protect`) and non-interactive overrides (`--force`).
+* **Local AI Log Summarization (`repopilot logs`):**
+Unifies log tailing across system logs (`journalctl`), files, and Docker containers with real-time level/pattern filtering, providing instant offline AI summarization (`--summarize`) via Ollama.
+
+---
+
+### 3. Key Technical & Design Limitations
+
+1. **Parent-Shell Injection Requirement (`env switch`):** Changing parent environment variables requires wrapping the execution in `eval`. Direct invocation without `eval` will display exports to `STDOUT` without mutating the parent environment.
+2. **Local LLM Dependency & Fallback:** Intelligent fallback and log summarization rely on a running Ollama service. If Ollama is unreachable, RepoPilot gracefully degrades to deterministic rules without crashing the workflow.
+3. **Local Git Scope:** `repopilot clean` targets local merged git branches to preserve speed and safety; remote branch pruning is deliberately excluded to prevent unauthorized upstream mutations.
