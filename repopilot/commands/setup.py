@@ -164,13 +164,13 @@ def _scan(target_dir):
     for filename in sorted(entries):
         if filename in [d[0] for d in detected]:
             continue
-            
+
         filepath = os.path.join(target_dir, filename)
         if not os.path.isfile(filepath) or filename.startswith("."):
             continue
-            
+
         ext = os.path.splitext(filename)[1].lower()
-        
+
         # Rule fallback for common script extensions
         if ext in (".bat", ".cmd"):
             detected.append((filename, "rule_script_bat"))
@@ -225,9 +225,9 @@ def _resolve(detected, target_dir):
                 cmd = f"bash {filename}"
                 ptype = "Shell Script"
             elif category == "rule_script_ps1":
-                cmd = f"powershell .\\{filename}"
+                cmd = f"powershell {os.path.join('.', filename)}"
                 ptype = "PowerShell Script"
-            
+
             if cmd not in seen_commands:
                 seen_commands.add(cmd)
                 plan.append((ptype, cmd, filename))
@@ -263,7 +263,7 @@ def _llm_resolve(filename, target_dir):
 
     import platform
     os_name = platform.system()
-    
+
     system_prompt = (
         "You are a build-system expert. The user will show you a file from a "
         "software project. Respond with ONLY the single shell command needed to "
@@ -396,17 +396,39 @@ def _execute(plan, target_dir):
     for project_type, cmd, filename in plan:
         print(f"  > Running: {cmd}")
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
                 shell=True,
                 cwd=target_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                errors="replace"
             )
-            if result.returncode == 0:
+
+            output_lines = []
+            if process.stdout:
+                for line in process.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    output_lines.append(line)
+
+            process.wait()
+
+            if process.returncode == 0:
                 print(f"  [OK] {project_type} setup complete")
             else:
-                print(f"  [FAIL] {project_type} setup failed (exit {result.returncode})")
-                _error(f"command '{cmd}' exited with code {result.returncode}")
-                has_failure = True
+                print(
+                    f"  [FAIL] {project_type} setup failed (exit {process.returncode})")
+                _error(
+                    f"command '{cmd}' exited with code {process.returncode}")
+
+                full_output = "".join(output_lines)
+                if _diagnose_and_retry(cmd, full_output, filename, target_dir):
+                    print(f"  [OK] {project_type} setup complete after fix")
+                else:
+                    has_failure = True
         except OSError as exc:
             print(f"  [FAIL] {project_type} setup failed ({exc})")
             _error(f"failed to run '{cmd}': {exc}")
@@ -425,6 +447,183 @@ def _execute(plan, target_dir):
 # Helpers
 # ---------------------------------------------------------------------
 
+def _diagnose_and_retry(failed_cmd, output, filename, target_dir):
+    """
+    Attempts to diagnose a failure using the local LLM, suggest a fix,
+    and optionally retry the failed command.
+    Returns True if the fix was applied and the retry succeeded, False otherwise.
+    """
+    import platform
+
+    # Read file content if possible
+    filepath = os.path.join(target_dir, filename)
+    file_content = ""
+    try:
+        if os.path.isfile(filepath):
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                file_content = "".join([next(f) for _ in range(200)])
+    except (StopIteration, OSError, IOError):
+        pass
+
+    os_name = platform.system()
+
+    system_prompt = (
+        "You are an expert developer helping to debug a build/install failure. "
+        "The user will provide the failed command, its output, their OS, and relevant file contents. "
+        "Your task is to identify the root cause and suggest ONE specific, safe, non-destructive fix command. "
+        "Respond STRICTLY in the following format, including the delimiters:\n"
+        "<<<DIAGNOSIS>>>\n"
+        "cause: <one-line plain-language explanation>\n"
+        "fix_command: <a single safe shell command, or NONE if no safe fix exists>\n"
+        "risk_note: <one short line on what this fix does, or NONE>\n"
+        "<<<END>>>"
+    )
+
+    # Truncate output if it's extremely long to avoid context limit issues
+    if len(output) > 4000:
+        output = output[-4000:]
+
+    user_prompt = (
+        f"OS: {os_name}\n"
+        f"Failed command: {failed_cmd}\n"
+        f"Output (last 4000 chars):\n{output}\n\n"
+    )
+    if file_content:
+        user_prompt += f"File content ({filename} - first 200 lines):\n```\n{file_content}\n```\n"
+
+    print("  [AI] Analyzing failure...", flush=True)
+
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.0,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        # Give it a bit more time than the default 5s since it's reading output and thinking
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_S * 4) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        raw = body["choices"][0]["message"]["content"].strip()
+    except Exception:
+        # Graceful degradation
+        return False
+
+    # Parse response defensively
+    match = re.search(r"<<<DIAGNOSIS>>>(.*?)<<<END>>>", raw, re.DOTALL)
+    if not match:
+        return False
+
+    diagnosis_text = match.group(1).strip()
+
+    cause = "Unknown"
+    fix_cmd = ""
+    risk_note = ""
+
+    for line in diagnosis_text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("cause:"):
+            cause = line[len("cause:"):].strip()
+        elif line.lower().startswith("fix_command:"):
+            fix_cmd = line[len("fix_command:"):].strip()
+        elif line.lower().startswith("risk_note:"):
+            risk_note = line[len("risk_note:"):].strip()
+
+    if not fix_cmd or fix_cmd.upper() == "NONE":
+        return False
+
+    # Validate fix_cmd using the existing sanitize function
+    sanitized_cmd = _sanitise_llm_response(fix_cmd)
+    if not sanitized_cmd:
+        return False
+    fix_cmd = sanitized_cmd
+
+    # Check for system-level install to visually warn the user
+    is_system_level = False
+    system_tools = {"choco", "brew", "apt-get", "apt",
+                    "sudo", "winget", "pacman", "yum", "dnf", "apk"}
+    first_word = fix_cmd.split()[0].lower() if fix_cmd.split() else ""
+    if first_word in system_tools:
+        is_system_level = True
+
+    print(f"\n  🔎 Diagnosis: {cause}")
+
+    if is_system_level:
+        print(f"  ⚠️  WARNING: SYSTEM-LEVEL CHANGE SUGGESTED")
+        print(f"  💡 Suggested fix: {fix_cmd}")
+    else:
+        print(f"  💡 Suggested fix: {fix_cmd}")
+
+    if risk_note and risk_note.upper() != "NONE":
+        print(f"     ({risk_note})")
+    print()
+
+    # Prompt user
+    try:
+        answer = input("  Apply this fix? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+
+    if answer not in ("y", "yes"):
+        return False
+
+    # Apply fix
+    print(f"  > Running fix: {fix_cmd}")
+    fix_process = subprocess.Popen(
+        fix_cmd,
+        shell=True,
+        cwd=target_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        errors="replace"
+    )
+    if fix_process.stdout:
+        for line in fix_process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    fix_process.wait()
+
+    if fix_process.returncode != 0:
+        print(f"  [FAIL] Fix command failed (exit {fix_process.returncode})")
+        return False
+
+    # Retry original command
+    print(f"  > Retrying original command: {failed_cmd}")
+    retry_process = subprocess.Popen(
+        failed_cmd,
+        shell=True,
+        cwd=target_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        errors="replace"
+    )
+    if retry_process.stdout:
+        for line in retry_process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    retry_process.wait()
+
+    if retry_process.returncode == 0:
+        return True
+    else:
+        print(f"  [FAIL] Retry failed (exit {retry_process.returncode})")
+        return False
+
+
 def _error(msg):
     """Print a formatted error to stderr per the shared convention."""
-    print(f"Error: {msg}. Run 'repopilot setup --help' for usage.", file=sys.stderr)
+    print(
+        f"Error: {msg}. Run 'repopilot setup --help' for usage.", file=sys.stderr)
