@@ -8,9 +8,7 @@ It integrates multiple environment, setup, log analysis, and branch cleaning uti
 You can install the package directly from the source code:
 
 ```bash
-git clone https://github.com/yashtripathi1517/Terminal-Velocity-CLI
-cd Terminal-Velocity-CLI
-pip install -e .
+pip install git+https://github.com/Vikhyaat-Srivastava/Terminal-velocity-CLI-Merged.git
 ```
 
 ## Usage
